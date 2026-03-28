@@ -8,20 +8,28 @@ Works with any OpenAI-compatible embedding/reranking server.
 Measures:
   - Single text latency (p50, p95, p99)
   - Batch throughput (texts/sec, embeddings/sec)
-  - Batch scaling (1, 4, 8, 16, 32, 64 texts)
+  - Batch scaling (1, 4, 8, 16, 32 texts)
   - Concurrent request throughput
+  - Text length scaling (100 to 16K chars with diverse text)
+  - Max input size discovery (binary search)
   - Rerank latency (per-document cost)
+  - Rerank document-count scaling (1 to 32 docs)
   - Image embedding latency (if multimodal)
   - Similarity quality (semantic pair accuracy)
 
+Uses diverse multi-domain vocabulary (IT, manufacturing, marketing, philosophy,
+science) to accurately represent real tokenization costs.
+
 Usage:
-  python nemotron_benchmark.py --url http://localhost:8020
-  python nemotron_benchmark.py --url http://localhost:8020 --api-key my_secret_key --all
-  python nemotron_benchmark.py --url http://localhost:8025 --rerank --api-key my_secret_key
-  python nemotron_benchmark.py --url http://localhost:8020 --output results.json
+  python benchmark.py --url http://localhost:8020
+  python benchmark.py --url http://localhost:8020 --all
+  python benchmark.py --url http://localhost:8025 --rerank --all
+  python benchmark.py --url http://localhost:8020 --max-input
+  python benchmark.py --url http://localhost:8020 --corpus book_chapter.txt --all
+  python benchmark.py --url http://localhost:8020 --output results.json
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import base64
@@ -51,22 +59,35 @@ except ImportError:
 # Synthetic Data Generators (like vllm bench random / random-mm)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Vocabulary for realistic-ish random text (avoids pure gibberish)
+# Diverse vocabulary across multiple domains — NOT just IT terms.
+# Matches the diverse probe text in _probe_model_limits() to accurately
+# represent real tokenization costs (repeated domain words under-count tokens).
 _VOCAB = (
+    # IT/Infrastructure
     "server deployment kubernetes docker container orchestration pipeline "
     "database replication failover monitoring metrics latency throughput "
     "authentication authorization security encryption certificate "
-    "infrastructure configuration management automation provisioning "
     "microservice gateway load balancer health check endpoint "
-    "storage cache queue message broker event stream "
-    "cluster node pod replica scaling autoscale horizontal "
-    "network firewall subnet routing proxy reverse DNS "
-    "version release rollback canary blue green strategy "
-    "testing integration unit regression performance benchmark "
-    "logging tracing observability dashboard alert notification "
-    "API REST GraphQL gRPC protocol buffer serialization "
-    "schema migration index partition shard query optimizer "
-    "memory CPU GPU thread process pool connection "
+    # Manufacturing/Lean
+    "Toyota Production System jidoka automation kanban scheduling kaizen "
+    "continuous improvement just-in-time delivery bottleneck throughput "
+    "Goldratt Theory Constraints focusing steps gemba muda muri mura "
+    # Marketing/Business
+    "segmentation positioning differentiation brand equity customer "
+    "competitive advantage market share revenue pricing strategy "
+    "Porter five forces supplier buyer substitution rivalry entrants "
+    # Philosophy/Literature
+    "dharma artha kama moksha Mahabharata Kurukshetra Pandavas Kauravas "
+    "narrative philosophical discourse Vedic traditions ethical principles "
+    "dharmasutras societal organization legal frameworks ritual procedures "
+    # Science/Technical
+    "algorithm optimization gradient descent convergence neural network "
+    "transformer attention mechanism embedding vector dimensionality "
+    "hypothesis experiment observation measurement statistical significance "
+    # General
+    "collaboration responsibility infrastructure communication framework "
+    "implementation architecture documentation specification requirement "
+    "analysis evaluation synthesis recommendation comprehensive overview "
 ).split()
 
 
@@ -190,6 +211,75 @@ RERANK_TESTS = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Endpoint Discovery
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def discover_endpoint(base_url: str, headers: dict, kind: str = "embed") -> Optional[str]:
+    """Auto-discover the working endpoint for embed or rerank.
+    Handles servers at any path depth (e.g. /v1/embeddings, /embeddings,
+    /some/long/path/v1/rerank, etc.).
+
+    Strategy:
+    1. If base_url already ends with /embeddings or /rerank, use it as-is
+    2. Otherwise try appending common suffixes in order
+    """
+    base = base_url.rstrip("/")
+
+    if kind == "embed":
+        # If URL already ends with an embeddings path, try it directly
+        if base.endswith("/embeddings"):
+            try:
+                r = requests.post(base, headers=headers, json={"input": ["test"]}, timeout=10)
+                if r.status_code in (200, 401):
+                    return base
+            except Exception:
+                pass
+
+        # Try common suffixes
+        suffixes = ["/v1/embeddings", "/embeddings"]
+        test_payload = {"input": ["test"]}
+    else:
+        if base.endswith("/rerank"):
+            try:
+                r = requests.post(base, headers=headers,
+                                  json={"query": "test", "documents": ["doc"]}, timeout=10)
+                if r.status_code in (200, 401):
+                    return base
+            except Exception:
+                pass
+
+        suffixes = ["/v1/rerank", "/rerank"]
+        test_payload = {"query": "test", "documents": ["doc"]}
+
+    for suffix in suffixes:
+        url = base + suffix
+        try:
+            r = requests.post(url, headers=headers, json=test_payload, timeout=10)
+            if r.status_code in (200, 401, 400):
+                return url
+        except Exception:
+            continue
+
+    return None
+
+
+def discover_health(base_url: str) -> dict:
+    """Try common health/info endpoints and return whatever we find."""
+    base = base_url.rstrip("/")
+    for path in ["/health", "/info", "/v1/models", "/models", "/"]:
+        try:
+            r = requests.get(base + path, timeout=5)
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    return {"status": "ok", "_raw": r.text[:200]}
+        except Exception:
+            continue
+    return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Benchmark Core
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -269,10 +359,9 @@ def latency_stats(times_ms: list) -> dict:
 # Benchmark Tests
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def bench_single_latency(url: str, headers: dict, warmup: int = 3, iterations: int = 20) -> dict:
+def bench_single_latency(endpoint: str, headers: dict, warmup: int = 3, iterations: int = 20) -> dict:
     """Measure single-text embedding latency."""
     print("  Running single text latency benchmark...")
-    endpoint = f"{url}/v1/embeddings"
     text = BENCHMARK_TEXTS[0]
 
     # Warmup
@@ -295,10 +384,9 @@ def bench_single_latency(url: str, headers: dict, warmup: int = 3, iterations: i
     return stats
 
 
-def bench_batch_scaling(url: str, headers: dict, warmup: int = 2) -> dict:
+def bench_batch_scaling(endpoint: str, headers: dict, warmup: int = 2) -> dict:
     """Measure how latency scales with batch size."""
     print("  Running batch scaling benchmark...")
-    endpoint = f"{url}/v1/embeddings"
     batch_sizes = [1, 4, 8, 16, 32]
     results = {}
 
@@ -334,10 +422,9 @@ def bench_batch_scaling(url: str, headers: dict, warmup: int = 2) -> dict:
     return results
 
 
-def bench_concurrent(url: str, headers: dict, concurrency: int = 4, total_requests: int = 20) -> dict:
+def bench_concurrent(endpoint: str, headers: dict, concurrency: int = 4, total_requests: int = 20) -> dict:
     """Measure throughput under concurrent load."""
     print(f"  Running concurrent benchmark (concurrency={concurrency})...")
-    endpoint = f"{url}/v1/embeddings"
     text = BENCHMARK_TEXTS[0]
 
     def do_request(_):
@@ -363,27 +450,9 @@ def bench_concurrent(url: str, headers: dict, concurrency: int = 4, total_reques
     return stats
 
 
-def bench_rerank(url: str, headers: dict, warmup: int = 2, iterations: int = 10) -> dict:
+def bench_rerank(endpoint: str, headers: dict, warmup: int = 2, iterations: int = 10) -> dict:
     """Measure reranking latency."""
     print("  Running rerank latency benchmark...")
-    endpoint_candidates = [f"{url}/v1/rerank", f"{url}/rerank"]
-
-    # Find working endpoint
-    endpoint = None
-    for ep in endpoint_candidates:
-        try:
-            r = requests.post(ep, headers=headers, json={
-                "query": "test", "documents": ["doc1"]
-            }, timeout=10)
-            if r.status_code in (200, 400):
-                endpoint = ep
-                break
-        except Exception:
-            continue
-
-    if not endpoint:
-        return {"error": "No rerank endpoint found"}
-
     query = RERANK_TESTS[0][0]
     docs = RERANK_TESTS[0][1]
 
@@ -407,24 +476,9 @@ def bench_rerank(url: str, headers: dict, warmup: int = 2, iterations: int = 10)
     return stats
 
 
-def bench_rerank_accuracy(url: str, headers: dict) -> dict:
+def bench_rerank_accuracy(endpoint: str, headers: dict) -> dict:
     """Test reranking quality on known test cases."""
     print("  Running rerank accuracy test...")
-    endpoint_candidates = [f"{url}/v1/rerank", f"{url}/rerank"]
-
-    endpoint = None
-    for ep in endpoint_candidates:
-        try:
-            r = requests.post(ep, headers=headers, json={"query": "test", "documents": ["doc"]}, timeout=10)
-            if r.status_code in (200, 400):
-                endpoint = ep
-                break
-        except Exception:
-            continue
-
-    if not endpoint:
-        return {"error": "No rerank endpoint found"}
-
     correct = 0
     total = len(RERANK_TESTS)
 
@@ -447,10 +501,9 @@ def bench_rerank_accuracy(url: str, headers: dict) -> dict:
     }
 
 
-def bench_similarity_quality(url: str, headers: dict) -> dict:
+def bench_similarity_quality(endpoint: str, headers: dict) -> dict:
     """Test embedding quality using semantic similarity pairs."""
     print("  Running similarity quality test...")
-    endpoint = f"{url}/v1/embeddings"
 
     correct = 0
     total = len(SIMILARITY_PAIRS)
@@ -493,17 +546,26 @@ def bench_similarity_quality(url: str, headers: dict) -> dict:
     }
 
 
-def bench_long_text(url: str, headers: dict) -> dict:
-    """Measure latency vs text length."""
+def bench_long_text(endpoint: str, headers: dict, corpus_text: str = "") -> dict:
+    """Measure latency vs text length. Uses diverse text to accurately
+    represent real tokenization costs (repeated text under-counts tokens)."""
     print("  Running text length scaling benchmark...")
-    endpoint = f"{url}/v1/embeddings"
+    # Use corpus text if available, otherwise generate diverse synthetic text
+    if corpus_text and len(corpus_text) >= 16000:
+        base_text = corpus_text
+    else:
+        base_text = generate_random_text(20000, seed=42)
 
-    base_text = " ".join(BENCHMARK_TEXTS[:5])  # ~500 chars
-    lengths = [100, 500, 1000, 2000, 4000, 8000]
+    lengths = [100, 500, 1000, 2000, 4000, 8000, 16000]
     results = {}
 
     for target_len in lengths:
-        text = (base_text * ((target_len // len(base_text)) + 1))[:target_len]
+        # Use different offsets for each length to avoid repeating the same prefix
+        offset = (target_len * 7) % max(1, len(base_text) - target_len)
+        text = base_text[offset:offset + target_len]
+        if len(text) < target_len:
+            text = base_text[:target_len]
+
         times = []
         for _ in range(3):
             t0 = time.perf_counter()
@@ -511,6 +573,11 @@ def bench_long_text(url: str, headers: dict) -> dict:
             elapsed = (time.perf_counter() - t0) * 1000
             if r.status_code == 200:
                 times.append(elapsed)
+            elif r.status_code in (413, 422, 400):
+                # Input too long for model — record as max
+                print(f"    {target_len:5d} chars: REJECTED (status {r.status_code})")
+                results[f"len_{target_len}"] = {"chars": target_len, "status": "rejected"}
+                break
 
         if times:
             avg = statistics.mean(times)
@@ -520,13 +587,93 @@ def bench_long_text(url: str, headers: dict) -> dict:
     return results
 
 
-def bench_random(url: str, headers: dict, num_prompts: int = 50,
+def bench_max_input(endpoint: str, headers: dict, mode: str = "embed") -> dict:
+    """Discover maximum input size by binary search. Reports the largest
+    text length (in chars) that the model accepts without error."""
+    print(f"  Probing max input size ({mode})...")
+
+    # Generate diverse text for probing
+    probe_text = generate_random_text(100000, seed=99)
+
+    def try_size(n: int) -> bool:
+        text = probe_text[:n]
+        try:
+            if mode == "embed":
+                r = requests.post(endpoint, headers=headers,
+                                  json={"input": [text]}, timeout=30)
+            else:
+                r = requests.post(endpoint, headers=headers,
+                                  json={"query": "test query", "documents": [text]}, timeout=30)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    # Coarse scan: find approximate ceiling
+    ceiling = 1000
+    for size in [2000, 4000, 8000, 16000, 32000, 64000]:
+        if try_size(size):
+            ceiling = size
+            print(f"    {size:6d} chars: OK")
+        else:
+            print(f"    {size:6d} chars: REJECTED")
+            break
+
+    # Binary search between last-good and first-bad
+    lo, hi = ceiling, ceiling * 2
+    while hi - lo > 500:
+        mid = (lo + hi) // 2
+        if try_size(mid):
+            lo = mid
+        else:
+            hi = mid
+
+    print(f"    Max input: ~{lo:,} chars")
+    return {"max_input_chars": lo, "mode": mode}
+
+
+def bench_rerank_scaling(endpoint: str, headers: dict, warmup: int = 2) -> dict:
+    """Measure how rerank latency scales with document count."""
+    print("  Running rerank document-count scaling...")
+    query = "deployment strategy for production systems"
+    base_docs = BENCHMARK_TEXTS[:32]
+    doc_counts = [1, 4, 8, 16, 32]
+    results = {}
+
+    for count in doc_counts:
+        docs = base_docs[:count] if count <= len(base_docs) else (
+            base_docs * (count // len(base_docs) + 1))[:count]
+
+        # Warmup
+        for _ in range(warmup):
+            requests.post(endpoint, headers=headers, json={"query": query, "documents": docs})
+
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            r = requests.post(endpoint, headers=headers, json={"query": query, "documents": docs})
+            elapsed = (time.perf_counter() - t0) * 1000
+            if r.status_code == 200:
+                times.append(elapsed)
+
+        if times:
+            avg = statistics.mean(times)
+            per_doc = avg / count
+            results[f"docs_{count}"] = {
+                "total_ms": round(avg, 1),
+                "per_doc_ms": round(per_doc, 1),
+                "docs_per_sec": round(1000.0 / per_doc, 1),
+            }
+            print(f"    docs={count:3d}: {avg:7.1f}ms total, {per_doc:6.1f}ms/doc")
+
+    return results
+
+
+def bench_random(endpoint: str, headers: dict, num_prompts: int = 50,
                  input_len: int = 128, batch_size: int = 1) -> dict:
     """Pure throughput benchmark with synthetic random text.
     Similar to vllm bench random — no accuracy testing, just raw speed.
     No external datasets needed."""
     print(f"  Running random text benchmark (n={num_prompts}, len={input_len}, batch={batch_size})...")
-    endpoint = f"{url}/v1/embeddings"
 
     # Generate all texts upfront
     texts = [generate_random_text(input_len, seed=i) for i in range(num_prompts)]
@@ -566,14 +713,13 @@ def bench_random(url: str, headers: dict, num_prompts: int = 50,
     return stats
 
 
-def bench_random_mm(url: str, headers: dict, num_prompts: int = 10,
+def bench_random_mm(endpoint: str, headers: dict, num_prompts: int = 10,
                     input_len: int = 64, image_size: int = 64) -> dict:
     """Multimodal throughput benchmark with synthetic random text + images.
     Similar to vllm bench random-mm — generates random images inline,
     no external datasets needed."""
     print(f"  Running random multimodal benchmark (n={num_prompts}, text_len={input_len}, "
           f"img={image_size}x{image_size})...")
-    endpoint = f"{url}/v1/embeddings"
 
     # Generate inputs: alternate text and image
     times_text = []
@@ -661,6 +807,10 @@ def main():
                         help="Pure throughput: random text, no accuracy (like vllm bench random)")
     parser.add_argument("--random-mm", action="store_true",
                         help="Multimodal throughput: random text+images (like vllm bench random-mm)")
+    parser.add_argument("--max-input", action="store_true",
+                        help="Discover maximum input size via binary search")
+    parser.add_argument("--corpus", default="",
+                        help="Path to a text file for realistic long-text benchmarks (e.g. a book chapter)")
     parser.add_argument("--num-prompts", type=int, default=50,
                         help="Number of prompts for random/random-mm benchmarks (default: 50)")
     parser.add_argument("--input-len", type=int, default=128,
@@ -675,61 +825,123 @@ def main():
     if args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
 
-    # Check server
+    # Check server health
     print(f"\nConnecting to {url}...")
-    try:
-        r = requests.get(f"{url}/health", timeout=5)
-        info = r.json()
+    info = discover_health(url)
+    if not info:
+        print(f"  WARNING: No health endpoint found at {url}, continuing anyway...")
+        info = {}
+    else:
         print(f"  Model: {info.get('model', 'unknown')}")
         print(f"  Type:  {info.get('model_type', 'unknown')}")
-        print(f"  Device: {info.get('device', 'unknown')} ({info.get('dtype', '')})")
-    except Exception as e:
-        print(f"  ERROR: Cannot connect to {url}: {e}")
-        print(f"  Is the server running? Try: python nemotron_server.py --model-dir <path>")
-        sys.exit(1)
+        if info.get('device'):
+            print(f"  Device: {info.get('device', 'unknown')} ({info.get('dtype', '')})")
 
     results = BenchmarkResults()
     results.server_info = info
 
+    # Load corpus text if provided
+    corpus_text = ""
+    if args.corpus:
+        try:
+            corpus_text = Path(args.corpus).read_text(encoding="utf-8", errors="ignore")
+            print(f"  Corpus loaded: {len(corpus_text):,} chars from {args.corpus}")
+        except Exception as e:
+            print(f"  WARNING: Could not load corpus: {e}")
+
     # Determine what to run
-    has_specific = args.embed or args.rerank or args.quality or args.random or getattr(args, 'random_mm', False)
+    has_specific = (args.embed or args.rerank or args.quality or args.random
+                    or getattr(args, 'random_mm', False) or args.max_input)
     run_embed = args.embed or args.all or (not has_specific)
     run_rerank = args.rerank or args.all
     run_quality = args.quality or args.all
     run_random = args.random or args.all
     run_random_mm = getattr(args, 'random_mm', False) or args.all
+    run_max_input = args.max_input or args.all
 
-    model_type = info.get("model_type", "embed")
+    # Auto-detect model type from health info, or from what endpoints exist
+    model_type = info.get("model_type", "")
+    if not model_type:
+        # Try to discover: if user asked for --rerank, assume rerank; otherwise probe
+        if args.rerank and not args.embed:
+            model_type = "rerank"
+        elif args.embed and not args.rerank:
+            model_type = "embed"
+        else:
+            # Probe both
+            if discover_endpoint(url, headers, "embed"):
+                model_type = "embed"
+            elif discover_endpoint(url, headers, "rerank"):
+                model_type = "rerank"
+            else:
+                print("  ERROR: Could not find any embedding or rerank endpoint.")
+                sys.exit(1)
+        print(f"  Auto-detected type: {model_type}")
 
-    if run_embed and model_type == "embed":
+    # Discover endpoints
+    embed_endpoint = None
+    rerank_endpoint = None
+
+    need_embed = (run_embed or run_random or run_random_mm or
+                  (run_quality and model_type == "embed") or
+                  (run_max_input and model_type == "embed"))
+    need_rerank = (run_rerank or
+                   (run_quality and model_type == "rerank") or
+                   (run_max_input and model_type == "rerank"))
+
+    if need_embed:
+        embed_endpoint = discover_endpoint(url, headers, "embed")
+        if embed_endpoint:
+            print(f"  Embed endpoint: {embed_endpoint}")
+        elif model_type == "embed":
+            print("  ERROR: Could not find embedding endpoint")
+            sys.exit(1)
+
+    if need_rerank:
+        rerank_endpoint = discover_endpoint(url, headers, "rerank")
+        if rerank_endpoint:
+            print(f"  Rerank endpoint: {rerank_endpoint}")
+        elif model_type == "rerank":
+            print("  ERROR: Could not find rerank endpoint")
+            sys.exit(1)
+
+    if run_max_input:
+        print("\n--- Max Input Size Discovery ---")
+        if model_type == "rerank" and rerank_endpoint:
+            results.add("Max Input Size", bench_max_input(rerank_endpoint, headers, mode="rerank"))
+        elif embed_endpoint:
+            results.add("Max Input Size", bench_max_input(embed_endpoint, headers, mode="embed"))
+
+    if run_embed and model_type == "embed" and embed_endpoint:
         print("\n--- Embedding Benchmarks ---")
-        results.add("Single Text Latency", bench_single_latency(url, headers, args.warmup, args.iterations))
-        results.add("Batch Scaling", bench_batch_scaling(url, headers, args.warmup))
-        results.add("Concurrent Requests", bench_concurrent(url, headers, args.concurrency))
-        results.add("Text Length Scaling", bench_long_text(url, headers))
+        results.add("Single Text Latency", bench_single_latency(embed_endpoint, headers, args.warmup, args.iterations))
+        results.add("Batch Scaling", bench_batch_scaling(embed_endpoint, headers, args.warmup))
+        results.add("Concurrent Requests", bench_concurrent(embed_endpoint, headers, args.concurrency))
+        results.add("Text Length Scaling", bench_long_text(embed_endpoint, headers, corpus_text=corpus_text))
 
-    if run_rerank and model_type == "rerank":
+    if run_rerank and model_type == "rerank" and rerank_endpoint:
         print("\n--- Rerank Benchmarks ---")
-        results.add("Rerank Latency", bench_rerank(url, headers, args.warmup, args.iterations))
+        results.add("Rerank Latency", bench_rerank(rerank_endpoint, headers, args.warmup, args.iterations))
+        results.add("Rerank Document Scaling", bench_rerank_scaling(rerank_endpoint, headers, args.warmup))
 
     if run_quality:
         print("\n--- Quality Benchmarks ---")
-        if model_type == "embed":
-            results.add("Semantic Similarity Quality", bench_similarity_quality(url, headers))
-        if model_type == "rerank":
-            results.add("Rerank Accuracy", bench_rerank_accuracy(url, headers))
+        if model_type == "embed" and embed_endpoint:
+            results.add("Semantic Similarity Quality", bench_similarity_quality(embed_endpoint, headers))
+        if model_type == "rerank" and rerank_endpoint:
+            results.add("Rerank Accuracy", bench_rerank_accuracy(rerank_endpoint, headers))
 
-    if run_random and model_type == "embed":
+    if run_random and model_type == "embed" and embed_endpoint:
         print("\n--- Random Text Throughput (no accuracy, pure speed) ---")
         results.add("Random Text Throughput", bench_random(
-            url, headers, num_prompts=args.num_prompts,
+            embed_endpoint, headers, num_prompts=args.num_prompts,
             input_len=args.input_len, batch_size=args.batch_size,
         ))
 
-    if run_random_mm and model_type == "embed":
+    if run_random_mm and model_type == "embed" and embed_endpoint:
         print("\n--- Random Multimodal Throughput (text + synthetic images) ---")
         results.add("Random Multimodal Throughput", bench_random_mm(
-            url, headers, num_prompts=min(args.num_prompts, 10),
+            embed_endpoint, headers, num_prompts=min(args.num_prompts, 10),
             input_len=args.input_len,
         ))
 

@@ -187,11 +187,18 @@ def select_device(force_device: str = "") -> tuple:
         info["reason"] = "Intel XPU detected"
     elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
         # MPS is available but Nemotron VL model runs slower on MPS due to
-        # custom op fallbacks. Use CPU with bfloat16 which is faster.
-        # Keeping MPS detection for future models that may benefit.
-        device = "cpu"
-        info["reason"] = "Apple Silicon (CPU+bfloat16 faster than MPS for this architecture)"
-        info["mps_available"] = True
+        # custom op fallbacks — unless PYTORCH_ENABLE_MPS_FALLBACK=1 is set
+        # AND PyTorch >= 2.4 (which has many more MPS operators).
+        # Default to CPU with bfloat16+SDPA which is typically faster.
+        # User can override with --device mps to try Metal acceleration.
+        if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
+            device = "mps"
+            info["reason"] = "Apple Silicon MPS (with CPU fallback for unsupported ops)"
+            info["mps_fallback"] = True
+        else:
+            device = "cpu"
+            info["reason"] = "Apple Silicon (CPU+bfloat16+SDPA; set PYTORCH_ENABLE_MPS_FALLBACK=1 to try MPS)"
+            info["mps_available"] = True
     else:
         device = "cpu"
         info["reason"] = "CPU fallback"
@@ -217,14 +224,20 @@ def select_device(force_device: str = "") -> tuple:
             dtype = torch.float32
 
     # Attention implementation
+    # SDPA (Scaled Dot Product Attention) is the optimal fallback for non-CUDA:
+    # it uses PyTorch's built-in fused attention kernels, significantly faster
+    # than "eager" on Apple Silicon CPU and Intel with AVX-512.
     if device == "cuda":
         try:
-            # flash_attention_2 requires CUDA and specific GPU
             attn_impl = "flash_attention_2"
         except Exception:
-            attn_impl = "eager"
+            attn_impl = "sdpa"
+    elif device == "mps":
+        # MPS may not support all SDPA paths; try sdpa, fall back to eager
+        attn_impl = "sdpa"
     else:
-        attn_impl = "eager"
+        # CPU: SDPA is well-supported and much faster than eager
+        attn_impl = "sdpa"
 
     info["dtype"] = str(dtype)
     info["attn_impl"] = attn_impl
@@ -516,18 +529,39 @@ class ServerState:
             if threads > 0:
                 optimal_threads = threads
             else:
-                # Auto: sweet spot is min(cores, 8) — hyperthreading adds overhead
-                optimal_threads = max(1, min(physical_cores, 8))
+                # Auto-detect: try to use performance cores only
+                # Apple Silicon: M1=8(4P+4E), M2=8(4P+4E), M3 Pro=12(6P+6E), M3 Max=16(12P+4E)
+                # Intel: use physical cores (no hyperthreading benefit for inference)
+                import platform
+                is_apple = platform.machine() == "arm64" and platform.system() == "Darwin"
+                if is_apple:
+                    # Apple Silicon: use ~75% of cores (targets P-cores, avoids E-cores)
+                    optimal_threads = max(4, int(physical_cores * 0.75))
+                else:
+                    # x86: use all physical cores (hyperthreading detected via os.cpu_count)
+                    optimal_threads = max(1, min(physical_cores, 16))
             torch.set_num_threads(optimal_threads)
-            torch.set_num_interop_threads(max(1, optimal_threads // 2))
+            torch.set_num_interop_threads(max(1, optimal_threads // 4))
             logger.info(f"  CPU threads: {optimal_threads} intra-op, "
-                        f"{max(1, optimal_threads // 2)} inter-op (of {physical_cores} available)")
+                        f"{max(1, optimal_threads // 4)} inter-op (of {physical_cores} available)")
 
         logger.info(f"  Parameters: {param_str}")
         if self.embedding_dims:
             logger.info(f"  Embedding dims: {self.embedding_dims}")
         logger.info(f"  Context length: {self.context_length}")
         logger.info(f"  Loaded in {self.load_time_s:.1f}s")
+
+        # torch.compile: JIT-compile the model's computation graph for fused operations
+        # This can significantly speed up CPU inference by eliminating Python overhead
+        # and fusing pointwise operations. Safe to skip if it fails (some model architectures
+        # with custom ops may not be compilable).
+        try:
+            logger.info("  Compiling model graph with torch.compile...")
+            t_compile = time.time()
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            logger.info(f"  torch.compile completed in {time.time() - t_compile:.1f}s")
+        except Exception as e:
+            logger.info(f"  torch.compile skipped (non-fatal): {e}")
 
         # Warmup: run a probe inference to JIT-compile kernels and warm caches
         if do_warmup:
@@ -570,6 +604,7 @@ class EmbeddingResponse(BaseModel):
 class RerankRequest(BaseModel):
     query: str = Field(..., description="Query to rank documents against")
     documents: list[str] = Field(..., description="Documents to rerank")
+    images: Optional[list[Optional[str]]] = Field(default=None, description="Optional base64 image per document (parallel to documents list)")
     model: str = Field(default="", description="Model name (optional)")
     top_n: Optional[int] = Field(default=None, description="Return only top N results (sorted by score)")
 
@@ -689,6 +724,7 @@ async def list_models(_=Depends(check_api_key)):
 
 
 @app.post("/v1/embeddings")
+@app.post("/embeddings")
 async def create_embeddings(req: EmbeddingRequest, _=Depends(check_api_key),
                             __=Depends(check_ready)):
     """Generate embeddings for text and/or images (OpenAI-compatible)."""
@@ -780,11 +816,21 @@ async def rerank(req: RerankRequest, _=Depends(check_api_key), __=Depends(check_
 
     t0 = time.perf_counter()
 
-    examples = [{
-        "question": req.query,
-        "doc_text": doc,
-        "doc_image": "",
-    } for doc in req.documents]
+    # Build examples — optionally include images (parallel to documents list)
+    has_images = req.images and len(req.images) == len(req.documents)
+    examples = []
+    for i, doc in enumerate(req.documents):
+        img = ""
+        if has_images and req.images[i]:
+            try:
+                img = parse_image_from_b64(req.images[i])
+            except Exception:
+                img = ""  # Failed to parse image, fall back to text-only
+        examples.append({
+            "question": req.query,
+            "doc_text": doc,
+            "doc_image": img,
+        })
 
     try:
         batch_dict = state.processor.process_queries_documents_crossencoder(examples)

@@ -1,6 +1,6 @@
 # nemotron-encode
 
-High-performance inference server for NVIDIA Nemotron VL embedding and reranking models, with comprehensive benchmarking tools.
+High-performance inference server for NVIDIA Nemotron VL embedding and reranking models, with a universal benchmarking tool that works with any OpenAI-compatible embedding/reranking server.
 
 Serves [llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2) and [llama-nemotron-rerank-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-rerank-vl-1b-v2) via an OpenAI-compatible API with automatic model type detection, cross-platform device selection, Prometheus metrics, and a built-in test UI.
 
@@ -12,7 +12,7 @@ Serves [llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemot
 - **Cross-platform** — NVIDIA CUDA, AMD ROCm, Intel XPU, Apple Silicon, x86/ARM CPUs
 - **Production-ready** — Prometheus `/metrics`, `/health` readiness probe, graceful shutdown, API key auth
 - **Built-in test UI** — Interactive browser interface at `/` for quick testing
-- **Comprehensive benchmarks** — Latency, throughput, batch scaling, concurrent load, semantic quality tests, and synthetic random workloads (like `vllm bench random`)
+- **Comprehensive benchmarks** — Latency, throughput, batch scaling, concurrent load, max input discovery, semantic quality tests, and synthetic random workloads (like `vllm bench random`). Works with any OpenAI-compatible embedding/reranking server, not just Nemotron.
 
 ## Quick Start
 
@@ -27,6 +27,10 @@ python server.py --model-dir ./models/nvidia_llama-nemotron-embed-vl-1b-v2
 
 # 4. Start reranking server (in another terminal)
 python server.py --model-dir ./models/nvidia_llama-nemotron-rerank-vl-1b-v2 --port 8025
+
+# Apple Silicon (recommended — 3-26x faster with Metal):
+PYTORCH_ENABLE_MPS_FALLBACK=1 python server.py --model-dir ./models/nvidia_llama-nemotron-embed-vl-1b-v2 --device mps -t 12
+PYTORCH_ENABLE_MPS_FALLBACK=1 python server.py --model-dir ./models/nvidia_llama-nemotron-rerank-vl-1b-v2 --port 8025 --device mps -t 12
 
 # 5. Test it
 curl http://localhost:8020/health
@@ -72,6 +76,7 @@ git clone https://huggingface.co/nvidia/llama-nemotron-rerank-vl-1b-v2 \
 | Endpoint | Method | Description |
 |---|---|---|
 | `/v1/embeddings` | POST | OpenAI-compatible text/image embedding |
+| `/embeddings` | POST | Alias for `/v1/embeddings` (compatibility with non-v1 clients) |
 | `/v1/rerank` | POST | Cross-encoder document reranking |
 | `/rerank` | POST | Alias for `/v1/rerank` |
 | `/v1/similarity` | POST | Pairwise cosine similarity |
@@ -166,7 +171,7 @@ CPU inference performance is highly sensitive to thread count. The optimal value
 
 | Platform | Recommended | Why |
 |---|---|---|
-| Apple Silicon (M1-M4) | `-t 8` | Performance cores only; hyperthreading overhead on efficiency cores |
+| Apple Silicon (M1-M4) | `-t 12` | Use ~75% of cores (P-cores); auto-detected if not specified |
 | Intel (no HT) | `-t <physical_cores>` | One thread per physical core |
 | Intel (with HT) | `-t <physical_cores>` | Hyperthreading adds overhead for inference |
 | AMD Ryzen | `-t <physical_cores>` | CCX topology makes more threads counterproductive |
@@ -192,19 +197,31 @@ The server automatically selects the best available device:
 |---|---|---|---|
 | 1 | CUDA | NVIDIA GPU detected | Fastest (with flash_attention_2) |
 | 2 | Intel XPU | Intel discrete GPU | Fast |
-| 3 | CPU (bfloat16) | Apple Silicon detected | Good — see note below |
+| 3 | CPU (bfloat16+SDPA) | Apple Silicon detected | Good — use `--device mps` + `PYTORCH_ENABLE_MPS_FALLBACK=1` for 3-26x faster |
 | 4 | CPU (float32) | Fallback | Baseline |
 
 #### Apple Silicon Note
 
-While Apple Silicon supports MPS (Metal Performance Shaders), the Nemotron VL architecture uses custom operations (bidirectional attention, pixel shuffle, dynamic image tiling) that trigger MPS-to-CPU fallbacks. In testing, **MPS is 13x slower than CPU+bfloat16** for this specific model:
+Apple Silicon supports MPS (Metal Performance Shaders) and with recent PyTorch versions (2.4+), most MPS operators are now available. Combined with `PYTORCH_ENABLE_MPS_FALLBACK=1` for any remaining custom ops, **MPS is now dramatically faster than CPU** for these models:
 
-| Device | Single Text Latency | Notes |
-|---|---|---|
-| CPU + bfloat16 | 142ms | Default on Apple Silicon |
-| MPS + float32 | 1,850ms | Fallback ops dominate |
+| Device | Embed 1×500ch | Embed 5×500ch | Rerank 10×200ch | Notes |
+|---|---|---|---|---|
+| CPU + bfloat16 + SDPA (12t) | 885ms | 4,283ms | 6,879ms | Default on Apple Silicon |
+| **MPS + SDPA + compile** | **269ms** | **645ms** | **180ms** | **3-26x faster** |
 
-The server automatically selects CPU on Apple Silicon. You can force MPS with `--device mps` for experimentation, but it's not recommended.
+**Recommended for Apple Silicon:**
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 python server.py \
+  --model-dir ./models/nvidia_llama-nemotron-embed-vl-1b-v2 \
+  --device mps -t 12
+```
+
+The server defaults to CPU on Apple Silicon for maximum compatibility. Set `PYTORCH_ENABLE_MPS_FALLBACK=1` and `--device mps` to enable Metal acceleration. The first inference after startup may be slow (torch.compile JIT warmup); subsequent calls are fast.
+
+**Optimizations applied automatically:**
+- **SDPA attention** — Scaled Dot Product Attention replaces eager mode (works on both CPU and MPS)
+- **torch.compile** — JIT graph compilation fuses operations (amortized after first call)
+- **12 P-core threads** — Auto-detected on Apple Silicon (75% of cores, avoids E-cores)
 
 ### GGUF / llama.cpp Compatibility
 
@@ -215,11 +232,11 @@ GGUF conversion is **not currently feasible** for these models because:
 3. **No community conversions** — As of March 2026, no GGUF versions of any Nemotron embed/rerank model exist on Hugging Face
 4. **Embedding model bug** — llama.cpp has a known issue (#14459) with embedding-only model conversion
 
-The PyTorch inference path with CPU+bfloat16 and thread tuning remains the recommended approach.
+The PyTorch inference path with MPS+SDPA+compile is the recommended approach on Apple Silicon.
 
 ## Benchmarks
 
-All benchmarks collected on **MacBook Pro M3 Max** (16-core CPU, 128 GB unified memory), PyTorch 2.11.0, bfloat16, 8 threads.
+All benchmarks collected on **MacBook Pro M3 Max** (16-core CPU, 128 GB unified memory), PyTorch 2.x, SDPA attention, torch.compile, 12 threads.
 
 ### NVIDIA Baseline vs nemotron-encode Server
 
@@ -288,11 +305,29 @@ Semantic Similarity Quality: 88.9% (8/9 pairs correct)
 
 ## Benchmark Tool
 
-The benchmark tool supports multiple modes similar to `vllm bench`:
+The benchmark tool works with **any OpenAI-compatible embedding or reranking server** — not just Nemotron. It auto-discovers the correct endpoint path (`/v1/embeddings`, `/embeddings`, `/v1/rerank`, `/rerank`, or deeper paths) and auto-detects whether the server is an embedding or reranking model.
+
+**Tested with:**
+- nemotron-encode (Nemotron VL embed/rerank)
+- infinity_emb (all-MiniLM-L6-v2, ms-marco-MiniLM, mxbai-rerank-base)
+- Any server with `/health` or OpenAI-compatible endpoints
 
 ```bash
-# Full suite (latency + throughput + quality)
+# Full suite (latency + throughput + quality + max input discovery)
 python benchmark.py --url http://localhost:8020 --api-key KEY --all
+
+# Works with any embedding server — endpoint auto-detected
+python benchmark.py --url http://localhost:8011 --api-key KEY --embed
+# → discovers /embeddings (not /v1/embeddings) automatically
+
+# You can also pass the full endpoint path directly
+python benchmark.py --url http://localhost:8011/embeddings --api-key KEY --embed
+
+# Discover max input size via binary search
+python benchmark.py --url http://localhost:8020 --api-key KEY --max-input
+
+# Use real content for long-text benchmarks (avoids repeated-text token undercounting)
+python benchmark.py --url http://localhost:8012 --api-key KEY --embed --corpus book_chapter.txt
 
 # Pure throughput with synthetic random text (no external datasets needed)
 python benchmark.py --url http://localhost:8020 --random --num-prompts 100 -b 8
@@ -300,25 +335,38 @@ python benchmark.py --url http://localhost:8020 --random --num-prompts 100 -b 8
 # Multimodal throughput with synthetic random images
 python benchmark.py --url http://localhost:8020 --random-mm --num-prompts 10
 
-# Reranking benchmarks
+# Reranking benchmarks (includes document-count scaling)
 python benchmark.py --url http://localhost:8025 --rerank --api-key KEY
 
 # Save results to JSON
 python benchmark.py --url http://localhost:8020 --all -o results.json
 ```
 
+### Endpoint Discovery
+
+The benchmark auto-discovers working endpoints by probing in order:
+
+| Model Type | Probe Order |
+|---|---|
+| Embedding | `/v1/embeddings` → `/embeddings` |
+| Reranking | `/v1/rerank` → `/rerank` |
+
+If the `--url` already ends with `/embeddings` or `/rerank`, it's used as-is (supports deep paths like `http://host/api/v1/embeddings`). Model type (embed vs rerank) is read from `/health` if available, otherwise inferred from which endpoints respond.
+
 ### Benchmark Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--url` | (required) | Server URL |
+| `--url` | (required) | Server base URL (or full endpoint path) |
 | `--api-key` | (none) | Bearer token |
 | `--all` | off | Run all benchmarks |
 | `--embed` | off | Embedding latency/throughput |
-| `--rerank` | off | Reranking latency |
+| `--rerank` | off | Reranking latency + document-count scaling |
 | `--quality` | off | Semantic accuracy tests |
+| `--max-input` | off | Discover max input size via binary search |
 | `--random` | off | Pure throughput with synthetic text |
 | `--random-mm` | off | Multimodal throughput |
+| `--corpus` | (none) | Path to text file for realistic long-text benchmarks |
 | `--num-prompts` | `50` | Prompts for random benchmarks |
 | `--input-len` | `128` | Text length (chars) for random |
 | `-b, --batch-size` | `1` | Batch size for random |
